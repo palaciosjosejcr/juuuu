@@ -1,0 +1,209 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// -------- CONFIGURACIÓN WIFI --------
+const char* ssid = "Estudiantes ITSVN";
+const char* password = "Estudiantes2018*";
+
+WebServer server(80);
+
+// -------- CONFIGURACIÓN RELÉS (14) --------
+const uint8_t reles[] = {23, 22, 21, 19, 18, 5, 17, 16, 4, 2, 15, 13, 12, 14};
+const int numReles = 14;
+
+// Variables de control
+unsigned long tiempoAnterior = 0;
+int intervalo = 1000; 
+int paso = 0;
+int secuenciaActiva = 0;
+bool ejecutando = false;
+
+// --- ESTRUCTURA DEL HMI (HTML/CSS) ---
+const char* html_index = R"=====(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HMI - Instituto Vida Nueva</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7)), 
+                        url('https://images.unsplash.com/photo-1581092334651-ddf26d9a1930?auto=format&fit=crop&q=80&w=1000');
+            background-size: cover;
+            background-attachment: fixed;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .header {
+            text-shadow: 2px 2px 10px rgba(0,0,0,0.8);
+            margin-bottom: 30px;
+        }
+        .header h1 { margin: 0; font-size: 2.5em; color: #fff; }
+        .header h2 { margin: 5px; font-weight: 300; color: #00d4ff; }
+
+        .panel {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 30px;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 15px 35px rgba(0,0,0,0.5);
+            width: 90%;
+            max-width: 450px;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 18px;
+            margin: 10px 0;
+            border: none;
+            border-radius: 12px;
+            color: white;
+            font-weight: bold;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+        }
+
+        .btn:active { transform: scale(0.96); }
+
+        /* Colores por secuencia */
+        .s1 { background: linear-gradient(45deg, #00c6ff, #0072ff); }
+        .s2 { background: linear-gradient(45deg, #f093fb, #f5576c); }
+        .s3 { background: linear-gradient(45deg, #43e97b, #38f9d7); }
+        .s4 { background: linear-gradient(45deg, #fa709a, #fee140); color: #333; }
+        .off { background: #ff4b2b; margin-top: 20px; }
+
+        #status {
+            margin-top: 20px;
+            font-size: 14px;
+            color: #ccc;
+            background: rgba(0,0,0,0.4);
+            padding: 5px 15px;
+            border-radius: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>INSTITUTO VIDA NUEVA</h1>
+        <h2>Panel de Control ESP32</h2>
+    </div>
+
+    <div class="panel">
+        <button class="btn s1" onclick="enviar('/s1')">Secuencia 1 (+A/+B/+C/+D...)</button>
+        <button class="btn s2" onclick="enviar('/s2')">Secuencia 2 (Bloque ABCD)</button>
+        <button class="btn s3" onclick="enviar('/s3')">Secuencia 3 (+AB / +CD)</button>
+        <button class="btn s4" onclick="enviar('/s4')">Secuencia 4 (Ciclo Mixto)</button>
+        <button class="btn off" onclick="enviar('/off')">⚠ DETENER TODO</button>
+        <center><p id="status">Sistema en línea</p></center>
+    </div>
+
+    <script>
+        function enviar(ruta) {
+            document.getElementById('status').innerText = "Ejecutando...";
+            fetch(ruta)
+                .then(r => { 
+                    document.getElementById('status').innerText = "Comando recibido"; 
+                    setTimeout(() => document.getElementById('status').innerText = "Sistema en línea", 2000);
+                })
+                .catch(e => document.getElementById('status').innerText = "Error de conexión");
+        }
+    </script>
+</body>
+</html>
+)=====";
+
+// --- LÓGICA DE GRUPOS ---
+void setGrupo(char grupo, bool estado) {
+  int inicio, fin;
+  if (grupo == 'A') { inicio = 0; fin = 2; }
+  else if (grupo == 'B') { inicio = 3; fin = 5; }
+  else if (grupo == 'C') { inicio = 6; fin = 8; }
+  else { inicio = 9; fin = 13; } // Grupo D
+  
+  for (int i = inicio; i <= fin; i++) {
+    digitalWrite(reles[i], estado ? LOW : HIGH); 
+  }
+}
+
+void apagarTodo() {
+  for (int i = 0; i < numReles; i++) digitalWrite(reles[i], HIGH);
+}
+
+void ejecutarPaso() {
+  switch (secuenciaActiva) {
+    case 1: // +A/+B/+C/+D / -A/-B/-C/-D
+      if (paso < 4) setGrupo("ABCD"[paso], true);
+      else if (paso < 8) setGrupo("ABCD"[paso-4], false);
+      else { ejecutando = false; }
+      break;
+    case 2: // +ABCD / -ABCD
+      if (paso == 0) { setGrupo('A',1); setGrupo('B',1); setGrupo('C',1); setGrupo('D',1); }
+      else if (paso == 1) { apagarTodo(); }
+      else { ejecutando = false; }
+      break;
+    case 3: // +A+B / +C+D / -A-B / -C-D
+      if (paso == 0) { setGrupo('A',1); setGrupo('B',1); }
+      else if (paso == 1) { setGrupo('C',1); setGrupo('D',1); }
+      else if (paso == 2) { setGrupo('A',0); setGrupo('B',0); }
+      else if (paso == 3) { setGrupo('C',0); setGrupo('D',0); }
+      else { ejecutando = false; }
+      break;
+    case 4: // Mixta Cascada
+      if (paso == 0) setGrupo('A',1); else if (paso == 1) setGrupo('B',1);
+      else if (paso == 2) setGrupo('A',0); else if (paso == 3) setGrupo('B',0);
+      else if (paso == 4) setGrupo('C',1); else if (paso == 5) setGrupo('D',1);
+      else if (paso == 6) { setGrupo('A',1); setGrupo('B',1); setGrupo('C',1); setGrupo('D',1); }
+      else if (paso == 7) apagarTodo();
+      else { ejecutando = false; }
+      break;
+  }
+  paso++;
+}
+
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < numReles; i++) {
+    pinMode(reles[i], OUTPUT);
+    digitalWrite(reles[i], HIGH);
+  }
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nIP: " + WiFi.localIP().toString());
+
+  server.on("/", []() { server.send(200, "text/html", html_index); });
+  server.on("/s1", []() { paso=0; secuenciaActiva=1; ejecutando=true; server.send(200); });
+  server.on("/s2", []() { paso=0; secuenciaActiva=2; ejecutando=true; server.send(200); });
+  server.on("/s3", []() { paso=0; secuenciaActiva=3; ejecutando=true; server.send(200); });
+  server.on("/s4", []() { paso=0; secuenciaActiva=4; ejecutando=true; server.send(200); });
+  server.on("/off", []() { ejecutando=false; apagarTodo(); server.send(200); });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  
+  if (ejecutando && millis() - tiempoAnterior >= intervalo) {
+    tiempoAnterior = millis();
+    ejecutarPaso();
+  }
+
+  // Auto-reconexión WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid, password);
+    delay(1000);
+  }
+}
